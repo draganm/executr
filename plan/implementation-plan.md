@@ -20,19 +20,24 @@
 1. **Create database schema migrations**
    - Create migrations directory
    - Write initial migration for jobs table with all fields
+   - Add job_attempts table for execution history
    - Add required indexes for performance
+   - Migrations run automatically on server startup
 
 2. **Write sqlc queries**
    - Job CRUD operations (create, get, list, update, delete)
-   - Claim job with atomic executor assignment
+   - Claim next available job atomically (priority order, then oldest first, set status to running)
+   - Record job attempt with executor IP
    - Heartbeat update query
    - Find stale jobs query
    - Cancel job query (with status validation)
    - Cleanup old jobs query
+   - Get job execution history
 
 3. **Generate database code**
    - Run sqlc generate
    - Create database connection helper
+   - Use pgx default pool settings
 
 ### Phase 3: Core Models and Shared Code
 1. **Define core data structures**
@@ -53,16 +58,16 @@
    - Setup structured logging with slog
 
 2. **Implement database connection and migrations**
-   - Connect to PostgreSQL
-   - Run migrations on startup
-   - Create connection pool
+   - Connect to PostgreSQL with pgx default pool settings
+   - Run migrations automatically on startup
+   - Handle migration failures gracefully
 
 3. **Build REST API handlers**
    - POST /api/v1/jobs - Submit job
    - GET /api/v1/jobs - List jobs
-   - GET /api/v1/jobs/{id} - Get job details
+   - GET /api/v1/jobs/{id} - Get job details with execution history
    - DELETE /api/v1/jobs/{id} - Cancel job
-   - PUT /api/v1/jobs/{id}/claim - Claim job for execution
+   - POST /api/v1/jobs/claim - Claim next available job (returns job details or empty if none available)
    - PUT /api/v1/jobs/{id}/heartbeat - Update heartbeat
    - PUT /api/v1/jobs/{id}/complete - Mark completed
    - PUT /api/v1/jobs/{id}/fail - Mark failed
@@ -82,7 +87,7 @@
    - GetJob(jobID) (job, error)
    - ListJobs(filter) ([]job, error)
    - CancelJob(jobID) error
-   - ClaimJob(executorID, priority) (job, error)
+   - ClaimNextJob(executorID, executorIP) (job, error) - returns next available job or nil
    - Heartbeat(jobID, executorID) error
    - CompleteJob(jobID, result) error
    - FailJob(jobID, result) error
@@ -96,22 +101,26 @@
 1. **Create executor command structure**
    - Add executor subcommand to CLI
    - Parse configuration from flags and env vars
-   - Generate executor ID if not provided
+   - Generate executor ID at startup: "{name}-{unique-id}" (e.g., "worker1-abc123")
+   - Name provided via --name flag, unique ID generated automatically
 
 2. **Implement binary cache**
    - Create cache directory structure
-   - SHA256 verification logic
+   - SHA256 verification before each execution
    - Cache lookup by URL and SHA256
-   - LRU eviction when size limit reached
+   - Download if not in cache or SHA256 mismatch
+   - Fail job if SHA256 doesn't match after download
+   - LRU eviction when cache size exceeds limit (default 400MB)
 
 3. **Build job execution engine**
-   - Poll server for jobs by priority
-   - Create temporary working directory for each job
-   - Download and cache binaries
-   - Execute binary with arguments and env vars in job directory
+   - Poll server for next available job via claim endpoint
+   - Server decides which job to return based on priority/age
+   - Create temporary working directory for received job
+   - Verify cached binary SHA256 or download
+   - Execute binary from cache location with job directory as working directory
    - Capture stdout, stderr, exit code
    - Handle execution errors
-   - Clean up job directory after completion
+   - Clean up job directory after completion (best effort)
 
 4. **Add heartbeat mechanism**
    - Start heartbeat goroutine when job claimed
@@ -122,9 +131,9 @@
    - Create isolated working directory for each job under configurable root
    - Job directory path: {work-dir}/{job-id}/
    - Set job directory as current directory for binary execution
-   - Clean up directory after job completion (success or failure)
-   - Clean up orphaned directories on executor restart
-   - Handle cleanup errors gracefully
+   - Clean up directory after job completion (best effort)
+   - On executor startup, remove all subdirectories of work-dir (best effort)
+   - Log cleanup failures but don't fail the job
 
 ### Phase 7: Submitter Implementation
 1. **Create submit command**
@@ -163,7 +172,8 @@
    - Priority-based execution
    - Job cancellation
    - Heartbeat timeout and recovery
-   - Multiple executor coordination
+   - Multiple executor coordination (different names)
+   - Verify executor ID format ("{name}-{suffix}")
    - Job working directory cleanup verification
    - Executor restart with orphaned directory cleanup
 
@@ -211,6 +221,7 @@
 
 #### Executor
 - Worker process that executes jobs
+- Unique ID generated at startup: "{name}-{unique-suffix}"
 - Binary cache with SHA256 verification
 - Heartbeat sender while running jobs
 - Stdout/stderr/exit code capture
@@ -243,11 +254,11 @@ All components support both environment variables and command-line flags.
 
 #### Executor Configuration
 - `--server-url` / `EXECUTR_SERVER_URL` - Server API endpoint
-- `--executor-id` / `EXECUTR_EXECUTOR_ID` - Unique executor ID (default: hostname-pid)
+- `--name` / `EXECUTR_NAME` - Executor name (required, used as prefix for executor ID)
 - `--cache-dir` / `EXECUTR_CACHE_DIR` - Binary cache directory (default: ~/.executr/cache)
 - `--work-dir` / `EXECUTR_WORK_DIR` - Root directory for job working directories (default: /tmp/executr-jobs)
 - `--poll-interval` / `EXECUTR_POLL_INTERVAL` - Job polling frequency (default: 5s)
-- `--max-cache-size` / `EXECUTR_MAX_CACHE_SIZE` - Maximum cache size in MB (default: 1000)
+- `--max-cache-size` / `EXECUTR_MAX_CACHE_SIZE` - Maximum cache size in MB (default: 400)
 - `--heartbeat-interval` / `EXECUTR_HEARTBEAT_INTERVAL` - Heartbeat frequency (default: 5s)
 - `--log-level` / `EXECUTR_LOG_LEVEL` - Log level
 
@@ -284,10 +295,23 @@ CREATE TABLE jobs (
     last_heartbeat TIMESTAMP
 );
 
+-- Job execution attempts history
+CREATE TABLE job_attempts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id UUID REFERENCES jobs(id) ON DELETE CASCADE,
+    executor_id TEXT NOT NULL,
+    executor_ip TEXT NOT NULL,
+    started_at TIMESTAMP DEFAULT NOW(),
+    ended_at TIMESTAMP,
+    status TEXT CHECK (status IN ('running', 'completed', 'failed', 'timeout')),
+    error_message TEXT
+);
+
 -- Indexes for performance
 CREATE INDEX idx_jobs_completed_at ON jobs(completed_at) WHERE status IN ('completed', 'failed', 'cancelled');
 CREATE INDEX idx_jobs_heartbeat ON jobs(last_heartbeat) WHERE status = 'running';
 CREATE INDEX idx_jobs_pending ON jobs(priority, created_at) WHERE status = 'pending';
+CREATE INDEX idx_job_attempts_job_id ON job_attempts(job_id);
 ```
 
 ### REST API Endpoints
@@ -296,9 +320,21 @@ All endpoints use JSON for request/response bodies.
 
 - `POST /api/v1/jobs` - Submit new job
 - `GET /api/v1/jobs` - List jobs with filtering
-- `GET /api/v1/jobs/{id}` - Get job details
-- `DELETE /api/v1/jobs/{id}` - Cancel pending job
-- `PUT /api/v1/jobs/{id}/claim` - Executor claims job
-- `PUT /api/v1/jobs/{id}/heartbeat` - Update heartbeat
-- `PUT /api/v1/jobs/{id}/complete` - Mark job completed with results
+- `GET /api/v1/jobs/{id}` - Get job details including execution attempts history
+- `DELETE /api/v1/jobs/{id}` - Cancel pending job only
+- `POST /api/v1/jobs/claim` - Executor claims next available job (server selects by priority: foreground > background > best_effort, then oldest first)
+  - Request body: `{"executor_id": "worker1-abc123", "executor_ip": "192.168.1.100"}`
+  - Response: Job details or 204 No Content if no jobs available
+- `PUT /api/v1/jobs/{id}/heartbeat` - Update heartbeat for running job
+- `PUT /api/v1/jobs/{id}/complete` - Mark job completed with stdout/stderr/exit code
 - `PUT /api/v1/jobs/{id}/fail` - Mark job failed with error details
+
+### Implementation Notes
+
+**Executor ID Generation:**
+- Each executor generates a unique ID at startup: `{name}-{unique-suffix}`
+- The name is provided via the `--name` flag (required)
+- A unique suffix (e.g., UUID or timestamp-based) is appended automatically
+- This allows multiple executors to run with the same logical name
+- The executor ID is used for tracking job attempts, heartbeats, and logging
+- Example: `worker1-a3f2c8d9` or `gpu-executor-1234567890`
