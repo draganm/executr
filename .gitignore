@@ -16,11 +16,14 @@ vendor/
 
 # Go workspace file
 go.work
+go.work.sum
 
 # Build output
 /executr
+/cmd/executr/executr
 /bin/
 /dist/
+/build/
 
 # IDE specific files
 .idea/
@@ -38,3 +41,20 @@ result-*
 # Environment files
 .env
 .env.local
+
+# Database
+pgdata/
+*.db
+*.sqlite
+
+# Temporary files
+tmp/
+temp/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage.txt
+coverage.html

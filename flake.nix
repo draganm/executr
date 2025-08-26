@@ -21,6 +21,10 @@
             golangci-lint
             delve
             
+            # Database tools
+            postgresql_16
+            sqlc
+            
             # Build tools
             gnumake
             pkg-config
@@ -28,23 +32,27 @@
             # Development tools
             git
             direnv
-            
-            # Optional: Database tools if needed
-            # postgresql
-            # sqlite
           ];
 
           shellHook = ''
-            echo "Go development environment"
+            echo "Executr development environment"
             echo "Go version: $(go version)"
+            echo "PostgreSQL version: $(psql --version)"
+            echo "sqlc version: $(sqlc version)"
             echo ""
             echo "Available commands:"
-            echo "  go build    - Build the project"
-            echo "  go test     - Run tests"
-            echo "  go run      - Run the application"
-            echo "  gopls       - Go language server"
-            echo "  dlv         - Delve debugger"
-            echo "  golangci-lint - Linter"
+            echo "  go build         - Build the project"
+            echo "  go test          - Run tests"
+            echo "  go run           - Run the application"
+            echo "  gopls            - Go language server"
+            echo "  dlv              - Delve debugger"
+            echo "  golangci-lint    - Linter"
+            echo "  sqlc generate    - Generate Go code from SQL"
+            echo ""
+            echo "PostgreSQL commands:"
+            echo "  pg_ctl -D ./pgdata init   - Initialize database"
+            echo "  pg_ctl -D ./pgdata start  - Start PostgreSQL"
+            echo "  pg_ctl -D ./pgdata stop   - Stop PostgreSQL"
           '';
 
          
