@@ -45,6 +45,7 @@
    - JobResult model (stdout, stderr, exit code)
    - Priority enum (foreground, background, best_effort)
    - Status enum (pending, running, completed, failed, cancelled)
+   - Job type: string without spaces (for filtering)
 
 2. **Create shared utilities**
    - SHA256 calculation helper
@@ -59,8 +60,10 @@
 
 2. **Implement database connection and migrations**
    - Connect to PostgreSQL with pgx default pool settings
+   - Implement automatic reconnection on connection loss
    - Run migrations automatically on startup
    - Handle migration failures gracefully
+   - No in-memory state during DB outages (all operations fail)
 
 3. **Build REST API handlers**
    - POST /api/v1/jobs - Submit job
@@ -75,7 +78,7 @@
 4. **Add background workers**
    - Heartbeat monitor (check every 5 seconds)
    - Job cleaner (run every hour, delete old jobs)
-   - Graceful shutdown handling
+   - Graceful shutdown using signal.NotifyContext and context propagation
 
 ### Phase 5: Client Package
 1. **Create client library structure**
@@ -107,20 +110,28 @@
 2. **Implement binary cache**
    - Create cache directory structure
    - SHA256 verification before each execution
-   - Cache lookup by URL and SHA256
+   - Cache keyed by SHA256 only (content-addressable)
    - Download if not in cache or SHA256 mismatch
+   - Set execute permissions (chmod +x) on downloaded binaries
    - Fail job if SHA256 doesn't match after download
    - LRU eviction when cache size exceeds limit (default 400MB)
+   - No download size or timeout limits
 
 3. **Build job execution engine**
-   - Poll server for next available job via claim endpoint
+   - Support concurrent job execution (configurable max jobs)
+   - Poll server for next available job via claim endpoint (one at a time)
    - Server decides which job to return based on priority/age
    - Create temporary working directory for received job
    - Verify cached binary SHA256 or download
    - Execute binary from cache location with job directory as working directory
+   - Pass arguments as separate args (exec.Command(bin, args...))
+   - Replace environment completely with job's env variables (no merging)
    - Capture stdout, stderr, exit code
+   - Truncate output if > 1MB (keep first 500 lines + last lines that fit)
    - Handle execution errors
+   - Stop claiming jobs after 1 minute of network failure
    - Clean up job directory after completion (best effort)
+   - Graceful shutdown: let running jobs complete on shutdown signal
 
 4. **Add heartbeat mechanism**
    - Start heartbeat goroutine when job claimed
@@ -139,7 +150,8 @@
 1. **Create submit command**
    - Add submit subcommand to CLI
    - Parse job parameters from flags/env
-   - Download binary to calculate SHA256 if not provided
+   - Stream download binary to calculate SHA256 in-place if not provided
+   - No temporary file storage - calculate SHA256 while streaming
    - Submit job to server
    - Display job ID
 
@@ -257,9 +269,11 @@ All components support both environment variables and command-line flags.
 - `--name` / `EXECUTR_NAME` - Executor name (required, used as prefix for executor ID)
 - `--cache-dir` / `EXECUTR_CACHE_DIR` - Binary cache directory (default: ~/.executr/cache)
 - `--work-dir` / `EXECUTR_WORK_DIR` - Root directory for job working directories (default: /tmp/executr-jobs)
+- `--max-jobs` / `EXECUTR_MAX_JOBS` - Maximum concurrent jobs (default: 1)
 - `--poll-interval` / `EXECUTR_POLL_INTERVAL` - Job polling frequency (default: 5s)
 - `--max-cache-size` / `EXECUTR_MAX_CACHE_SIZE` - Maximum cache size in MB (default: 400)
 - `--heartbeat-interval` / `EXECUTR_HEARTBEAT_INTERVAL` - Heartbeat frequency (default: 5s)
+- `--network-timeout` / `EXECUTR_NETWORK_TIMEOUT` - Stop claiming after network failure (default: 1m)
 - `--log-level` / `EXECUTR_LOG_LEVEL` - Log level
 
 #### Submitter Configuration
@@ -316,18 +330,33 @@ CREATE INDEX idx_job_attempts_job_id ON job_attempts(job_id);
 
 ### REST API Endpoints
 
-All endpoints use JSON for request/response bodies.
+All endpoints use JSON for request/response bodies. All timestamps in UTC format.
 
+- `GET /api/v1/health` - Health check endpoint
+  - Response: `{"status": "healthy", "database": "connected"}`
+- `GET /api/v1/metrics` - Prometheus-compatible metrics
 - `POST /api/v1/jobs` - Submit new job
-- `GET /api/v1/jobs` - List jobs with filtering
+- `GET /api/v1/jobs` - List jobs with filtering (by status, type, priority)
 - `GET /api/v1/jobs/{id}` - Get job details including execution attempts history
 - `DELETE /api/v1/jobs/{id}` - Cancel pending job only
-- `POST /api/v1/jobs/claim` - Executor claims next available job (server selects by priority: foreground > background > best_effort, then oldest first)
+- `POST /api/v1/jobs/claim` - Executor claims next available job (one at a time)
   - Request body: `{"executor_id": "worker1-abc123", "executor_ip": "192.168.1.100"}`
   - Response: Job details or 204 No Content if no jobs available
 - `PUT /api/v1/jobs/{id}/heartbeat` - Update heartbeat for running job
 - `PUT /api/v1/jobs/{id}/complete` - Mark job completed with stdout/stderr/exit code
 - `PUT /api/v1/jobs/{id}/fail` - Mark job failed with error details
+
+**Error Response Format:**
+```json
+{
+  "error": "error message",
+  "context": {
+    "field": "additional context",
+    "job_id": "uuid-if-relevant"
+  }
+}
+```
+Standard HTTP status codes: 200 OK, 201 Created, 204 No Content, 400 Bad Request, 404 Not Found, 500 Internal Server Error
 
 ### Implementation Notes
 
@@ -338,3 +367,57 @@ All endpoints use JSON for request/response bodies.
 - This allows multiple executors to run with the same logical name
 - The executor ID is used for tracking job attempts, heartbeats, and logging
 - Example: `worker1-a3f2c8d9` or `gpu-executor-1234567890`
+
+**Binary Execution:**
+- Downloaded binaries automatically get execute permissions (chmod +x)
+- No size or timeout limits for binary downloads
+- Binaries execute from cache location, not copied to work directory
+- Cache keyed by SHA256 only (content-addressable storage)
+- Architecture mismatches handled by OS (will fail naturally)
+
+**Job Arguments:**
+- Arguments passed as separate args to exec.Command(bin, args...)
+- No escaping or quoting needed - OS handles it
+- Arguments provided as array in job specification
+
+**Job Type Field:**
+- Free text string but cannot contain spaces (for filtering)
+- Used in GET /api/v1/jobs filtering
+- Examples: "data-processing", "ml-training", "report-generation"
+
+**Job Concurrency:**
+- Executors run 1 job by default, configurable via `--max-jobs`
+- Claims happen one at a time even with concurrency enabled
+- Each job gets its own goroutine and working directory
+- Heartbeats managed per job independently
+
+**Environment Variables:**
+- Job environment variables completely replace executor environment
+- No merging with existing environment variables
+- Clean environment for each job execution
+
+**Output Handling:**
+- Maximum output size: 1MB for stdout and stderr each
+- If output exceeds 1MB: keep first 500 lines, then as many lines from end as fit
+- Output truncation happens before storing in database
+
+**Network Resilience:**
+- Executor stops claiming new jobs after 1 minute of network failures
+- Existing jobs continue to run and retry sending results
+- Server automatically reconnects to database on connection loss
+- No in-memory queuing during database outages
+
+**Graceful Shutdown:**
+- Uses signal.NotifyContext for signal handling
+- Context propagation throughout the application
+- Running jobs allowed to complete before shutdown
+- New job claims stopped immediately on shutdown signal
+
+**Timestamps:**
+- All timestamps stored and returned in UTC
+- ISO 8601 format in JSON responses
+
+**Submitter SHA256 Calculation:**
+- Streams binary download for in-place SHA256 calculation
+- No temporary file storage required
+- Memory-efficient streaming approach
