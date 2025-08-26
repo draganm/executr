@@ -150,6 +150,7 @@
 1. **Create submit command**
    - Add submit subcommand to CLI
    - Parse job parameters from flags/env
+   - Support multiple --args and --env flags for arrays
    - Stream download binary to calculate SHA256 in-place if not provided
    - No temporary file storage - calculate SHA256 while streaming
    - Submit job to server
@@ -280,8 +281,8 @@ All components support both environment variables and command-line flags.
 - `--server-url` / `EXECUTR_SERVER_URL` - Server API endpoint
 - `--binary-url` / `EXECUTR_BINARY_URL` - Binary download URL (required for submit)
 - `--binary-sha256` / `EXECUTR_BINARY_SHA256` - Binary SHA256 (optional, auto-calculated)
-- `--args` / `EXECUTR_ARGS` - Arguments (comma-separated)
-- `--env` / `EXECUTR_ENV` - Environment variables (KEY=VALUE,...)
+- `--args` / `EXECUTR_ARGS` - Arguments (can be specified multiple times)
+- `--env` / `EXECUTR_ENV` - Environment variables KEY=VALUE (can be specified multiple times)
 - `--type` / `EXECUTR_TYPE` - Job type (informational)
 - `--priority` / `EXECUTR_PRIORITY` - Priority (foreground/background/best_effort)
 - `--output` / `EXECUTR_OUTPUT` - Output format (json/table)
@@ -343,8 +344,8 @@ All endpoints use JSON for request/response bodies. All timestamps in UTC format
   - Request body: `{"executor_id": "worker1-abc123", "executor_ip": "192.168.1.100"}`
   - Response: Job details or 204 No Content if no jobs available
 - `PUT /api/v1/jobs/{id}/heartbeat` - Update heartbeat for running job
-- `PUT /api/v1/jobs/{id}/complete` - Mark job completed with stdout/stderr/exit code
-- `PUT /api/v1/jobs/{id}/fail` - Mark job failed with error details
+- `PUT /api/v1/jobs/{id}/complete` - Mark job completed with stdout/stderr/exit code (single request)
+- `PUT /api/v1/jobs/{id}/fail` - Mark job failed with error details (single request)
 
 **Error Response Format:**
 ```json
@@ -421,3 +422,13 @@ Standard HTTP status codes: 200 OK, 201 Created, 204 No Content, 400 Bad Request
 - Streams binary download for in-place SHA256 calculation
 - No temporary file storage required
 - Memory-efficient streaming approach
+
+**Submitter Arguments and Environment:**
+- Multiple `--args` flags for arguments: `--args "arg1" --args "arg2"`
+- Multiple `--env` flags for environment: `--env "KEY1=value1" --env "KEY2=value2"`
+- Avoids parsing issues with special characters in values
+
+**Job Results:**
+- Complete/fail endpoints receive results in a single request
+- Stdout/stderr truncated before sending if > 1MB each
+- No chunking or streaming of results
