@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/draganm/executr/internal/executor"
 	"github.com/draganm/executr/internal/models"
@@ -57,22 +58,22 @@ func serverCommand() *cli.Command {
 				Value:   8080,
 				EnvVars: []string{"EXECUTR_PORT"},
 			},
-			&cli.IntFlag{
+			&cli.DurationFlag{
 				Name:    "cleanup-interval",
-				Usage:   "Cleanup frequency in seconds",
-				Value:   3600,
+				Usage:   "Cleanup frequency (e.g. 30m, 1h)",
+				Value:   time.Hour,
 				EnvVars: []string{"EXECUTR_CLEANUP_INTERVAL"},
 			},
-			&cli.IntFlag{
+			&cli.DurationFlag{
 				Name:    "job-retention",
-				Usage:   "Keep completed jobs duration in seconds",
-				Value:   172800,
+				Usage:   "Keep completed jobs duration (e.g. 24h, 48h)",
+				Value:   48 * time.Hour,
 				EnvVars: []string{"EXECUTR_JOB_RETENTION"},
 			},
-			&cli.IntFlag{
+			&cli.DurationFlag{
 				Name:    "heartbeat-timeout",
-				Usage:   "Stale job timeout in seconds",
-				Value:   15,
+				Usage:   "Stale job timeout (e.g. 15s, 30s)",
+				Value:   15 * time.Second,
 				EnvVars: []string{"EXECUTR_HEARTBEAT_TIMEOUT"},
 			},
 			&cli.StringFlag{
@@ -89,9 +90,9 @@ func serverCommand() *cli.Command {
 			cfg := &server.Config{
 				DatabaseURL:       c.String("db-url"),
 				Port:              c.Int("port"),
-				CleanupInterval:   c.Int("cleanup-interval"),
-				JobRetention:      c.Int("job-retention"),
-				HeartbeatTimeout:  c.Int("heartbeat-timeout"),
+				CleanupInterval:   int(c.Duration("cleanup-interval").Seconds()),
+				JobRetention:      int(c.Duration("job-retention").Seconds()),
+				HeartbeatTimeout:  int(c.Duration("heartbeat-timeout").Seconds()),
 				LogLevel:          c.String("log-level"),
 			}
 
@@ -162,10 +163,10 @@ func executorCommand() *cli.Command {
 				Value:   1,
 				EnvVars: []string{"EXECUTR_MAX_JOBS"},
 			},
-			&cli.IntFlag{
+			&cli.DurationFlag{
 				Name:    "poll-interval",
-				Usage:   "Job polling frequency in seconds",
-				Value:   5,
+				Usage:   "Job polling frequency (e.g. 5s, 10s)",
+				Value:   5 * time.Second,
 				EnvVars: []string{"EXECUTR_POLL_INTERVAL"},
 			},
 			&cli.IntFlag{
@@ -174,16 +175,16 @@ func executorCommand() *cli.Command {
 				Value:   400,
 				EnvVars: []string{"EXECUTR_MAX_CACHE_SIZE"},
 			},
-			&cli.IntFlag{
+			&cli.DurationFlag{
 				Name:    "heartbeat-interval",
-				Usage:   "Heartbeat frequency in seconds",
-				Value:   5,
+				Usage:   "Heartbeat frequency (e.g. 5s, 10s)",
+				Value:   5 * time.Second,
 				EnvVars: []string{"EXECUTR_HEARTBEAT_INTERVAL"},
 			},
-			&cli.IntFlag{
+			&cli.DurationFlag{
 				Name:    "network-timeout",
-				Usage:   "Stop claiming after network failure in seconds",
-				Value:   60,
+				Usage:   "Stop claiming after network failure (e.g. 60s, 2m)",
+				Value:   60 * time.Second,
 				EnvVars: []string{"EXECUTR_NETWORK_TIMEOUT"},
 			},
 			&cli.StringFlag{
@@ -221,10 +222,10 @@ func executorCommand() *cli.Command {
 				CacheDir:          c.String("cache-dir"),
 				WorkDir:           c.String("work-dir"),
 				MaxJobs:           c.Int("max-jobs"),
-				PollInterval:      c.Int("poll-interval"),
+				PollInterval:      int(c.Duration("poll-interval").Seconds()),
 				MaxCacheSize:      c.Int("max-cache-size"),
-				HeartbeatInterval: c.Int("heartbeat-interval"),
-				NetworkTimeout:    c.Int("network-timeout"),
+				HeartbeatInterval: int(c.Duration("heartbeat-interval").Seconds()),
+				NetworkTimeout:    int(c.Duration("network-timeout").Seconds()),
 			}
 
 			exec, err := executor.New(cfg)
