@@ -177,3 +177,34 @@ func (r *progressReader) Read(p []byte) (int, error) {
 	}
 	return n, err
 }
+
+// Downloader is a simple HTTP downloader with retry logic
+type Downloader struct {
+	MaxRetries int
+	RetryDelay time.Duration
+}
+
+// Download downloads from URL to the writer
+func (d *Downloader) Download(url string, w io.Writer) error {
+	client := NewRetryableHTTPClient()
+	client.SetTimeout(0) // No timeout for downloads
+	client.SetMaxRetries(d.MaxRetries)
+	
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to download: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed with status: %s", resp.Status)
+	}
+	
+	_, err = io.Copy(w, resp.Body)
+	return err
+}

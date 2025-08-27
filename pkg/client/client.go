@@ -75,6 +75,11 @@ type HTTPClient struct {
 	httpClient *utils.RetryableHTTPClient
 }
 
+// New creates a new HTTP client for the Executr server (simplified alias)
+func New(baseURL string) Client {
+	return NewClient(baseURL)
+}
+
 // NewClient creates a new HTTP client for the Executr server
 func NewClient(baseURL string) Client {
 	// Ensure baseURL doesn't end with a slash
