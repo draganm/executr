@@ -86,17 +86,37 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 
 	// Start server in background
+	serverErr := make(chan error, 1)
 	go func() {
 		if err := serverInstance.Run(ctx); err != nil && err != context.Canceled {
 			log.Printf("Server error: %v", err)
+			serverErr <- err
 		}
+		close(serverErr)
 	}()
 
 	// Wait for server to be ready
-	time.Sleep(2 * time.Second)
+	serverInstance.WaitReady()
+
+	// Check if server failed to start
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			Fail(fmt.Sprintf("Server failed to start: %v", err))
+		}
+	default:
+		// Server is still running, continue
+	}
+
+	// Small delay to ensure server is actually serving
+	time.Sleep(100 * time.Millisecond)
 
 	// Get server URL
-	serverURL = fmt.Sprintf("http://localhost:%d", serverInstance.Port())
+	port := serverInstance.Port()
+	if port == 0 {
+		Fail("Server port is 0 after ready")
+	}
+	serverURL = fmt.Sprintf("http://localhost:%d", port)
 
 	// Create test client
 	testClient = client.New(serverURL)

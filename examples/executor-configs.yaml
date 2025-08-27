@@ -1,0 +1,77 @@
+# Example Executor Configurations
+
+# Development executor - single job, verbose logging
+dev-executor:
+  server_url: http://localhost:8080
+  name: dev-worker
+  max_jobs: 1
+  poll_interval: 5s
+  cache_dir: /tmp/executr-cache
+  work_dir: /tmp/executr-work
+  max_cache_size: 100
+  log_level: debug
+
+# Production executor - general purpose
+prod-executor:
+  server_url: http://executr.prod.example.com:8080
+  name: worker
+  max_jobs: 4
+  poll_interval: 3s
+  cache_dir: /var/cache/executr
+  work_dir: /var/lib/executr/work
+  max_cache_size: 1000
+  heartbeat_interval: 5s
+  network_timeout: 60s
+  log_level: info
+
+# GPU executor - for ML workloads
+gpu-executor:
+  server_url: http://executr.example.com:8080
+  name: gpu-worker
+  max_jobs: 1  # GPU jobs are typically exclusive
+  poll_interval: 10s
+  cache_dir: /mnt/nvme/executr-cache  # Fast storage for models
+  work_dir: /mnt/nvme/executr-work
+  max_cache_size: 50000  # 50GB for large models
+  heartbeat_interval: 10s  # Longer heartbeat for long-running jobs
+  network_timeout: 300s  # 5 minutes for large model downloads
+  log_level: info
+
+# High-throughput executor - many small jobs
+batch-executor:
+  server_url: http://executr.example.com:8080
+  name: batch-worker
+  max_jobs: 16
+  poll_interval: 1s  # Fast polling for quick job pickup
+  cache_dir: /mnt/ssd/cache
+  work_dir: /mnt/ssd/work
+  max_cache_size: 500
+  heartbeat_interval: 3s
+  network_timeout: 30s
+  log_level: warn  # Less logging for performance
+
+# Edge executor - limited resources
+edge-executor:
+  server_url: https://executr.cloud.example.com
+  name: edge-device
+  max_jobs: 1
+  poll_interval: 30s  # Less frequent polling
+  cache_dir: /data/cache
+  work_dir: /data/work
+  max_cache_size: 50  # Limited storage
+  heartbeat_interval: 15s
+  network_timeout: 120s
+  log_level: error  # Minimal logging
+
+# CI/CD executor - for build jobs
+ci-executor:
+  server_url: http://executr.ci.example.com:8080
+  name: ci-runner
+  max_jobs: 2
+  poll_interval: 2s
+  cache_dir: /var/cache/ci-executr
+  work_dir: /var/lib/ci-executr/work
+  max_cache_size: 5000  # Cache build tools
+  heartbeat_interval: 5s
+  network_timeout: 60s
+  log_level: info

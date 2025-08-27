@@ -1,0 +1,125 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: executr
+      POSTGRES_USER: executr
+      POSTGRES_PASSWORD: executr-dev-password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U executr"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: server
+    environment:
+      EXECUTR_DB_URL: postgres://executr:executr-dev-password@postgres/executr?sslmode=disable
+      EXECUTR_PORT: 8080
+      EXECUTR_LOG_LEVEL: info
+      EXECUTR_CLEANUP_INTERVAL: 30m
+      EXECUTR_JOB_RETENTION: 24h
+      EXECUTR_HEARTBEAT_TIMEOUT: 15s
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  executor-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: executor
+    environment:
+      EXECUTR_SERVER_URL: http://server:8080
+      EXECUTR_NAME: executor-1
+      EXECUTR_MAX_JOBS: 2
+      EXECUTR_POLL_INTERVAL: 5s
+      EXECUTR_CACHE_DIR: /cache
+      EXECUTR_WORK_DIR: /work
+      EXECUTR_MAX_CACHE_SIZE: 500
+      EXECUTR_LOG_LEVEL: info
+    volumes:
+      - executor-1-cache:/cache
+      - executor-1-work:/work
+    depends_on:
+      server:
+        condition: service_healthy
+
+  executor-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: executor
+    environment:
+      EXECUTR_SERVER_URL: http://server:8080
+      EXECUTR_NAME: executor-2
+      EXECUTR_MAX_JOBS: 2
+      EXECUTR_POLL_INTERVAL: 5s
+      EXECUTR_CACHE_DIR: /cache
+      EXECUTR_WORK_DIR: /work
+      EXECUTR_MAX_CACHE_SIZE: 500
+      EXECUTR_LOG_LEVEL: info
+    volumes:
+      - executor-2-cache:/cache
+      - executor-2-work:/work
+    depends_on:
+      server:
+        condition: service_healthy
+
+  # Optional: Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - server
+
+  # Optional: Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres-data:
+  executor-1-cache:
+  executor-1-work:
+  executor-2-cache:
+  executor-2-work:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  default:
+    name: executr-network

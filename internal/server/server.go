@@ -49,12 +49,14 @@ type Server struct {
 	server  *http.Server
 	wg      sync.WaitGroup
 	port    int // actual port (for testing with port 0)
+	ready   chan struct{} // signals when server is ready
 }
 
 // New creates a new server instance
 func New(cfg *Config) (*Server, error) {
 	return &Server{
 		config: cfg,
+		ready:  make(chan struct{}),
 	}, nil
 }
 
@@ -67,9 +69,12 @@ func (s *Server) Run(ctx context.Context) error {
 	defer s.pool.Close()
 
 	// Run migrations
+	slog.Info("Running migrations...")
 	if err := s.runMigrations(); err != nil {
+		slog.Error("Failed to run migrations", "error", err)
 		return fmt.Errorf("failed to run migrations: %w", err)
 	}
+	slog.Info("Migrations completed successfully")
 
 	// Start background workers
 	s.startWorkers(ctx)
@@ -93,10 +98,14 @@ func (s *Server) Run(ctx context.Context) error {
 	if s.config.Port == 0 {
 		listener, err := net.Listen("tcp", ":0")
 		if err != nil {
+			close(s.ready) // Signal ready even on error
 			return fmt.Errorf("failed to create listener: %w", err)
 		}
 		s.port = listener.Addr().(*net.TCPAddr).Port
 		slog.Info("Starting server", "port", s.port)
+		
+		// Signal that server is ready now that we have a port
+		close(s.ready)
 		
 		go func() {
 			if err := s.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -105,8 +114,12 @@ func (s *Server) Run(ctx context.Context) error {
 		}()
 	} else {
 		s.port = s.config.Port
+		slog.Info("Starting server", "port", s.port)
+		
+		// Signal that server is ready
+		close(s.ready)
+		
 		go func() {
-			slog.Info("Starting server", "port", s.port)
 			if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				serverErr <- err
 			}
@@ -762,6 +775,11 @@ func (s *Server) writeError(w http.ResponseWriter, code int, message string, con
 // Port returns the actual port the server is listening on
 func (s *Server) Port() int {
 	return s.port
+}
+
+// WaitReady waits for the server to be ready
+func (s *Server) WaitReady() {
+	<-s.ready
 }
 
 // Admin endpoints
