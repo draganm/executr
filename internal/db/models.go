@@ -10,32 +10,32 @@ import (
 )
 
 type Job struct {
-	ID            uuid.UUID        `json:"id"`
-	Type          string           `json:"type"`
-	BinaryUrl     string           `json:"binary_url"`
-	BinarySha256  string           `json:"binary_sha256"`
-	Arguments     []string         `json:"arguments"`
-	EnvVariables  []byte           `json:"env_variables"`
-	Priority      string           `json:"priority"`
-	Status        string           `json:"status"`
-	ExecutorID    *string          `json:"executor_id"`
-	Stdout        *string          `json:"stdout"`
-	Stderr        *string          `json:"stderr"`
-	ExitCode      *int32           `json:"exit_code"`
-	ErrorMessage  *string          `json:"error_message"`
-	CreatedAt     pgtype.Timestamp `json:"created_at"`
-	StartedAt     pgtype.Timestamp `json:"started_at"`
-	CompletedAt   pgtype.Timestamp `json:"completed_at"`
-	LastHeartbeat pgtype.Timestamp `json:"last_heartbeat"`
+	ID            uuid.UUID          `json:"id"`
+	Type          string             `json:"type"`
+	BinaryUrl     string             `json:"binary_url"`
+	BinarySha256  string             `json:"binary_sha256"`
+	Arguments     []string           `json:"arguments"`
+	EnvVariables  []byte             `json:"env_variables"`
+	Priority      string             `json:"priority"`
+	Status        string             `json:"status"`
+	ExecutorID    pgtype.Text        `json:"executor_id"`
+	Stdout        pgtype.Text        `json:"stdout"`
+	Stderr        pgtype.Text        `json:"stderr"`
+	ExitCode      pgtype.Int4        `json:"exit_code"`
+	ErrorMessage  pgtype.Text        `json:"error_message"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	StartedAt     pgtype.Timestamptz `json:"started_at"`
+	CompletedAt   pgtype.Timestamptz `json:"completed_at"`
+	LastHeartbeat pgtype.Timestamptz `json:"last_heartbeat"`
 }
 
 type JobAttempt struct {
-	ID           uuid.UUID        `json:"id"`
-	JobID        uuid.UUID        `json:"job_id"`
-	ExecutorID   string           `json:"executor_id"`
-	ExecutorIp   string           `json:"executor_ip"`
-	StartedAt    pgtype.Timestamp `json:"started_at"`
-	EndedAt      pgtype.Timestamp `json:"ended_at"`
-	Status       string           `json:"status"`
-	ErrorMessage *string          `json:"error_message"`
+	ID           uuid.UUID          `json:"id"`
+	JobID        uuid.UUID          `json:"job_id"`
+	ExecutorID   string             `json:"executor_id"`
+	ExecutorIp   string             `json:"executor_ip"`
+	StartedAt    pgtype.Timestamptz `json:"started_at"`
+	EndedAt      pgtype.Timestamptz `json:"ended_at"`
+	Status       string             `json:"status"`
+	ErrorMessage pgtype.Text        `json:"error_message"`
 }

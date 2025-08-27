@@ -9,19 +9,43 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const countJobAttempts = `-- name: CountJobAttempts :one
-SELECT COUNT(*) as attempt_count
-FROM job_attempts
-WHERE job_id = $1
+const createJobAttempt = `-- name: CreateJobAttempt :one
+INSERT INTO job_attempts (
+    job_id, executor_id, executor_ip, status
+) VALUES (
+    $1, $2, $3, $4
+) RETURNING id, job_id, executor_id, executor_ip, started_at, ended_at, status, error_message
 `
 
-func (q *Queries) CountJobAttempts(ctx context.Context, jobID uuid.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countJobAttempts, jobID)
-	var attempt_count int64
-	err := row.Scan(&attempt_count)
-	return attempt_count, err
+type CreateJobAttemptParams struct {
+	JobID      uuid.UUID `json:"job_id"`
+	ExecutorID string    `json:"executor_id"`
+	ExecutorIp string    `json:"executor_ip"`
+	Status     string    `json:"status"`
+}
+
+func (q *Queries) CreateJobAttempt(ctx context.Context, arg CreateJobAttemptParams) (JobAttempt, error) {
+	row := q.db.QueryRow(ctx, createJobAttempt,
+		arg.JobID,
+		arg.ExecutorID,
+		arg.ExecutorIp,
+		arg.Status,
+	)
+	var i JobAttempt
+	err := row.Scan(
+		&i.ID,
+		&i.JobID,
+		&i.ExecutorID,
+		&i.ExecutorIp,
+		&i.StartedAt,
+		&i.EndedAt,
+		&i.Status,
+		&i.ErrorMessage,
+	)
+	return i, err
 }
 
 const getJobAttempts = `-- name: GetJobAttempts :many
@@ -82,60 +106,21 @@ func (q *Queries) GetLatestJobAttempt(ctx context.Context, jobID uuid.UUID) (Job
 	return i, err
 }
 
-const recordJobAttempt = `-- name: RecordJobAttempt :one
-INSERT INTO job_attempts (
-    job_id, executor_id, executor_ip, status
-) VALUES (
-    $1, $2, $3, 'running'
-)
-RETURNING id, job_id, executor_id, executor_ip, started_at, ended_at, status, error_message
-`
-
-type RecordJobAttemptParams struct {
-	JobID      uuid.UUID `json:"job_id"`
-	ExecutorID string    `json:"executor_id"`
-	ExecutorIp string    `json:"executor_ip"`
-}
-
-func (q *Queries) RecordJobAttempt(ctx context.Context, arg RecordJobAttemptParams) (JobAttempt, error) {
-	row := q.db.QueryRow(ctx, recordJobAttempt, arg.JobID, arg.ExecutorID, arg.ExecutorIp)
-	var i JobAttempt
-	err := row.Scan(
-		&i.ID,
-		&i.JobID,
-		&i.ExecutorID,
-		&i.ExecutorIp,
-		&i.StartedAt,
-		&i.EndedAt,
-		&i.Status,
-		&i.ErrorMessage,
-	)
-	return i, err
-}
-
 const updateJobAttempt = `-- name: UpdateJobAttempt :exec
-UPDATE job_attempts
-SET ended_at = NOW(),
+UPDATE job_attempts SET
+    ended_at = NOW(),
     status = $2,
     error_message = $3
-WHERE job_id = $1
-  AND executor_id = $4
-  AND ended_at IS NULL
+WHERE id = $1
 `
 
 type UpdateJobAttemptParams struct {
-	JobID        uuid.UUID `json:"job_id"`
-	Status       string    `json:"status"`
-	ErrorMessage *string   `json:"error_message"`
-	ExecutorID   string    `json:"executor_id"`
+	ID           uuid.UUID   `json:"id"`
+	Status       string      `json:"status"`
+	ErrorMessage pgtype.Text `json:"error_message"`
 }
 
 func (q *Queries) UpdateJobAttempt(ctx context.Context, arg UpdateJobAttemptParams) error {
-	_, err := q.db.Exec(ctx, updateJobAttempt,
-		arg.JobID,
-		arg.Status,
-		arg.ErrorMessage,
-		arg.ExecutorID,
-	)
+	_, err := q.db.Exec(ctx, updateJobAttempt, arg.ID, arg.Status, arg.ErrorMessage)
 	return err
 }
