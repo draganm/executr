@@ -399,9 +399,9 @@ var _ = Describe("Executr E2E Tests", func() {
 				exec, err := executor.New(execConfig)
 				Expect(err).NotTo(HaveOccurred())
 
-				go func() {
-					exec.Run(execCtx)
-				}()
+				go func(e *executor.Executor) {
+					e.Run(execCtx)
+				}(exec)
 			}
 
 			// Wait for all jobs to complete

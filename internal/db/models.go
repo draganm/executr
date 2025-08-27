@@ -27,6 +27,9 @@ type Job struct {
 	StartedAt     pgtype.Timestamptz `json:"started_at"`
 	CompletedAt   pgtype.Timestamptz `json:"completed_at"`
 	LastHeartbeat pgtype.Timestamptz `json:"last_heartbeat"`
+	MaxRetries    int32              `json:"max_retries"`
+	RetryCount    int32              `json:"retry_count"`
+	RetryAfter    pgtype.Timestamp   `json:"retry_after"`
 }
 
 type JobAttempt struct {

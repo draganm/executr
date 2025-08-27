@@ -12,22 +12,45 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const cancelJob = `-- name: CancelJob :exec
-UPDATE jobs SET
-    status = 'cancelled',
-    completed_at = NOW(),
-    error_message = 'Job cancelled by user'
+const cancelJob = `-- name: CancelJob :one
+UPDATE jobs
+SET status = 'cancelled',
+    completed_at = NOW()
 WHERE id = $1 AND status = 'pending'
+RETURNING id, type, binary_url, binary_sha256, arguments, env_variables, priority, status, executor_id, stdout, stderr, exit_code, error_message, created_at, started_at, completed_at, last_heartbeat, max_retries, retry_count, retry_after
 `
 
-func (q *Queries) CancelJob(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.Exec(ctx, cancelJob, id)
-	return err
+func (q *Queries) CancelJob(ctx context.Context, id uuid.UUID) (Job, error) {
+	row := q.db.QueryRow(ctx, cancelJob, id)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.Type,
+		&i.BinaryUrl,
+		&i.BinarySha256,
+		&i.Arguments,
+		&i.EnvVariables,
+		&i.Priority,
+		&i.Status,
+		&i.ExecutorID,
+		&i.Stdout,
+		&i.Stderr,
+		&i.ExitCode,
+		&i.ErrorMessage,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.LastHeartbeat,
+		&i.MaxRetries,
+		&i.RetryCount,
+		&i.RetryAfter,
+	)
+	return i, err
 }
 
 const claimNextJob = `-- name: ClaimNextJob :one
-UPDATE jobs SET
-    status = 'running',
+UPDATE jobs
+SET status = 'running',
     executor_id = $1,
     started_at = NOW(),
     last_heartbeat = NOW()
@@ -35,16 +58,16 @@ WHERE id = (
     SELECT id FROM jobs
     WHERE status = 'pending'
     ORDER BY 
-        CASE priority 
+        CASE priority
             WHEN 'foreground' THEN 1
             WHEN 'background' THEN 2
             WHEN 'best_effort' THEN 3
         END,
-        created_at ASC
+        created_at
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, type, binary_url, binary_sha256, arguments, env_variables, priority, status, executor_id, stdout, stderr, exit_code, error_message, created_at, started_at, completed_at, last_heartbeat
+RETURNING id, type, binary_url, binary_sha256, arguments, env_variables, priority, status, executor_id, stdout, stderr, exit_code, error_message, created_at, started_at, completed_at, last_heartbeat, max_retries, retry_count, retry_after
 `
 
 func (q *Queries) ClaimNextJob(ctx context.Context, executorID pgtype.Text) (Job, error) {
@@ -68,6 +91,9 @@ func (q *Queries) ClaimNextJob(ctx context.Context, executorID pgtype.Text) (Job
 		&i.StartedAt,
 		&i.CompletedAt,
 		&i.LastHeartbeat,
+		&i.MaxRetries,
+		&i.RetryCount,
+		&i.RetryAfter,
 	)
 	return i, err
 }
@@ -75,71 +101,38 @@ func (q *Queries) ClaimNextJob(ctx context.Context, executorID pgtype.Text) (Job
 const cleanupOldJobs = `-- name: CleanupOldJobs :exec
 DELETE FROM jobs
 WHERE status IN ('completed', 'failed', 'cancelled')
-  AND completed_at < NOW() - INTERVAL '1 second' * CAST($1 AS INTEGER)
+  AND completed_at < NOW() - $1::interval
 `
 
-func (q *Queries) CleanupOldJobs(ctx context.Context, dollar_1 int32) error {
+func (q *Queries) CleanupOldJobs(ctx context.Context, dollar_1 pgtype.Interval) error {
 	_, err := q.db.Exec(ctx, cleanupOldJobs, dollar_1)
 	return err
 }
 
-const completeJob = `-- name: CompleteJob :exec
-UPDATE jobs SET
-    status = 'completed',
+const completeJob = `-- name: CompleteJob :one
+UPDATE jobs
+SET status = 'completed',
     stdout = $2,
     stderr = $3,
     exit_code = $4,
     completed_at = NOW()
-WHERE id = $1 AND executor_id = $5 AND status = 'running'
+WHERE id = $1 AND status = 'running'
+RETURNING id, type, binary_url, binary_sha256, arguments, env_variables, priority, status, executor_id, stdout, stderr, exit_code, error_message, created_at, started_at, completed_at, last_heartbeat, max_retries, retry_count, retry_after
 `
 
 type CompleteJobParams struct {
-	ID         uuid.UUID   `json:"id"`
-	Stdout     pgtype.Text `json:"stdout"`
-	Stderr     pgtype.Text `json:"stderr"`
-	ExitCode   pgtype.Int4 `json:"exit_code"`
-	ExecutorID pgtype.Text `json:"executor_id"`
+	ID       uuid.UUID   `json:"id"`
+	Stdout   pgtype.Text `json:"stdout"`
+	Stderr   pgtype.Text `json:"stderr"`
+	ExitCode pgtype.Int4 `json:"exit_code"`
 }
 
-func (q *Queries) CompleteJob(ctx context.Context, arg CompleteJobParams) error {
-	_, err := q.db.Exec(ctx, completeJob,
+func (q *Queries) CompleteJob(ctx context.Context, arg CompleteJobParams) (Job, error) {
+	row := q.db.QueryRow(ctx, completeJob,
 		arg.ID,
 		arg.Stdout,
 		arg.Stderr,
 		arg.ExitCode,
-		arg.ExecutorID,
-	)
-	return err
-}
-
-const createJob = `-- name: CreateJob :one
-INSERT INTO jobs (
-    type, binary_url, binary_sha256, arguments, env_variables,
-    priority, status
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7
-) RETURNING id, type, binary_url, binary_sha256, arguments, env_variables, priority, status, executor_id, stdout, stderr, exit_code, error_message, created_at, started_at, completed_at, last_heartbeat
-`
-
-type CreateJobParams struct {
-	Type         string   `json:"type"`
-	BinaryUrl    string   `json:"binary_url"`
-	BinarySha256 string   `json:"binary_sha256"`
-	Arguments    []string `json:"arguments"`
-	EnvVariables []byte   `json:"env_variables"`
-	Priority     string   `json:"priority"`
-	Status       string   `json:"status"`
-}
-
-func (q *Queries) CreateJob(ctx context.Context, arg CreateJobParams) (Job, error) {
-	row := q.db.QueryRow(ctx, createJob,
-		arg.Type,
-		arg.BinaryUrl,
-		arg.BinarySha256,
-		arg.Arguments,
-		arg.EnvVariables,
-		arg.Priority,
-		arg.Status,
 	)
 	var i Job
 	err := row.Scan(
@@ -160,6 +153,62 @@ func (q *Queries) CreateJob(ctx context.Context, arg CreateJobParams) (Job, erro
 		&i.StartedAt,
 		&i.CompletedAt,
 		&i.LastHeartbeat,
+		&i.MaxRetries,
+		&i.RetryCount,
+		&i.RetryAfter,
+	)
+	return i, err
+}
+
+const createJob = `-- name: CreateJob :one
+INSERT INTO jobs (
+    type, binary_url, binary_sha256, arguments, env_variables, priority
+) VALUES (
+    $1, $2, $3, $4, $5, $6
+)
+RETURNING id, type, binary_url, binary_sha256, arguments, env_variables, priority, status, executor_id, stdout, stderr, exit_code, error_message, created_at, started_at, completed_at, last_heartbeat, max_retries, retry_count, retry_after
+`
+
+type CreateJobParams struct {
+	Type         string   `json:"type"`
+	BinaryUrl    string   `json:"binary_url"`
+	BinarySha256 string   `json:"binary_sha256"`
+	Arguments    []string `json:"arguments"`
+	EnvVariables []byte   `json:"env_variables"`
+	Priority     string   `json:"priority"`
+}
+
+func (q *Queries) CreateJob(ctx context.Context, arg CreateJobParams) (Job, error) {
+	row := q.db.QueryRow(ctx, createJob,
+		arg.Type,
+		arg.BinaryUrl,
+		arg.BinarySha256,
+		arg.Arguments,
+		arg.EnvVariables,
+		arg.Priority,
+	)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.Type,
+		&i.BinaryUrl,
+		&i.BinarySha256,
+		&i.Arguments,
+		&i.EnvVariables,
+		&i.Priority,
+		&i.Status,
+		&i.ExecutorID,
+		&i.Stdout,
+		&i.Stderr,
+		&i.ExitCode,
+		&i.ErrorMessage,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.LastHeartbeat,
+		&i.MaxRetries,
+		&i.RetryCount,
+		&i.RetryAfter,
 	)
 	return i, err
 }
@@ -173,46 +222,68 @@ func (q *Queries) DeleteJob(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
-const failJob = `-- name: FailJob :exec
-UPDATE jobs SET
-    status = 'failed',
-    error_message = $2,
-    stdout = $3,
-    stderr = $4,
-    exit_code = $5,
+const failJob = `-- name: FailJob :one
+UPDATE jobs
+SET status = 'failed',
+    stdout = $2,
+    stderr = $3,
+    exit_code = $4,
+    error_message = $5,
     completed_at = NOW()
-WHERE id = $1 AND executor_id = $6 AND status = 'running'
+WHERE id = $1 AND status = 'running'
+RETURNING id, type, binary_url, binary_sha256, arguments, env_variables, priority, status, executor_id, stdout, stderr, exit_code, error_message, created_at, started_at, completed_at, last_heartbeat, max_retries, retry_count, retry_after
 `
 
 type FailJobParams struct {
 	ID           uuid.UUID   `json:"id"`
-	ErrorMessage pgtype.Text `json:"error_message"`
 	Stdout       pgtype.Text `json:"stdout"`
 	Stderr       pgtype.Text `json:"stderr"`
 	ExitCode     pgtype.Int4 `json:"exit_code"`
-	ExecutorID   pgtype.Text `json:"executor_id"`
+	ErrorMessage pgtype.Text `json:"error_message"`
 }
 
-func (q *Queries) FailJob(ctx context.Context, arg FailJobParams) error {
-	_, err := q.db.Exec(ctx, failJob,
+func (q *Queries) FailJob(ctx context.Context, arg FailJobParams) (Job, error) {
+	row := q.db.QueryRow(ctx, failJob,
 		arg.ID,
-		arg.ErrorMessage,
 		arg.Stdout,
 		arg.Stderr,
 		arg.ExitCode,
-		arg.ExecutorID,
+		arg.ErrorMessage,
 	)
-	return err
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.Type,
+		&i.BinaryUrl,
+		&i.BinarySha256,
+		&i.Arguments,
+		&i.EnvVariables,
+		&i.Priority,
+		&i.Status,
+		&i.ExecutorID,
+		&i.Stdout,
+		&i.Stderr,
+		&i.ExitCode,
+		&i.ErrorMessage,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.LastHeartbeat,
+		&i.MaxRetries,
+		&i.RetryCount,
+		&i.RetryAfter,
+	)
+	return i, err
 }
 
 const findStaleJobs = `-- name: FindStaleJobs :many
-SELECT id, type, binary_url, binary_sha256, arguments, env_variables, priority, status, executor_id, stdout, stderr, exit_code, error_message, created_at, started_at, completed_at, last_heartbeat FROM jobs
+SELECT id, type, binary_url, binary_sha256, arguments, env_variables, priority, status, executor_id, stdout, stderr, exit_code, error_message, created_at, started_at, completed_at, last_heartbeat, max_retries, retry_count, retry_after FROM jobs
 WHERE status = 'running'
-  AND last_heartbeat < NOW() - INTERVAL '1 second' * CAST($1 AS INTEGER)
+  AND last_heartbeat < NOW() - INTERVAL '15 seconds'
 `
 
-func (q *Queries) FindStaleJobs(ctx context.Context, dollar_1 int32) ([]Job, error) {
-	rows, err := q.db.Query(ctx, findStaleJobs, dollar_1)
+func (q *Queries) FindStaleJobs(ctx context.Context) ([]Job, error) {
+	rows, err := q.db.Query(ctx, findStaleJobs)
 	if err != nil {
 		return nil, err
 	}
@@ -238,6 +309,9 @@ func (q *Queries) FindStaleJobs(ctx context.Context, dollar_1 int32) ([]Job, err
 			&i.StartedAt,
 			&i.CompletedAt,
 			&i.LastHeartbeat,
+			&i.MaxRetries,
+			&i.RetryCount,
+			&i.RetryAfter,
 		); err != nil {
 			return nil, err
 		}
@@ -250,7 +324,8 @@ func (q *Queries) FindStaleJobs(ctx context.Context, dollar_1 int32) ([]Job, err
 }
 
 const getJob = `-- name: GetJob :one
-SELECT id, type, binary_url, binary_sha256, arguments, env_variables, priority, status, executor_id, stdout, stderr, exit_code, error_message, created_at, started_at, completed_at, last_heartbeat FROM jobs WHERE id = $1
+SELECT id, type, binary_url, binary_sha256, arguments, env_variables, priority, status, executor_id, stdout, stderr, exit_code, error_message, created_at, started_at, completed_at, last_heartbeat, max_retries, retry_count, retry_after FROM jobs
+WHERE id = $1
 `
 
 func (q *Queries) GetJob(ctx context.Context, id uuid.UUID) (Job, error) {
@@ -274,12 +349,15 @@ func (q *Queries) GetJob(ctx context.Context, id uuid.UUID) (Job, error) {
 		&i.StartedAt,
 		&i.CompletedAt,
 		&i.LastHeartbeat,
+		&i.MaxRetries,
+		&i.RetryCount,
+		&i.RetryAfter,
 	)
 	return i, err
 }
 
 const listJobs = `-- name: ListJobs :many
-SELECT id, type, binary_url, binary_sha256, arguments, env_variables, priority, status, executor_id, stdout, stderr, exit_code, error_message, created_at, started_at, completed_at, last_heartbeat FROM jobs
+SELECT id, type, binary_url, binary_sha256, arguments, env_variables, priority, status, executor_id, stdout, stderr, exit_code, error_message, created_at, started_at, completed_at, last_heartbeat, max_retries, retry_count, retry_after FROM jobs
 WHERE ($1::text IS NULL OR status = $1)
   AND ($2::text IS NULL OR type = $2)
   AND ($3::text IS NULL OR priority = $3)
@@ -328,6 +406,9 @@ func (q *Queries) ListJobs(ctx context.Context, arg ListJobsParams) ([]Job, erro
 			&i.StartedAt,
 			&i.CompletedAt,
 			&i.LastHeartbeat,
+			&i.MaxRetries,
+			&i.RetryCount,
+			&i.RetryAfter,
 		); err != nil {
 			return nil, err
 		}
@@ -340,8 +421,8 @@ func (q *Queries) ListJobs(ctx context.Context, arg ListJobsParams) ([]Job, erro
 }
 
 const resetStaleJob = `-- name: ResetStaleJob :exec
-UPDATE jobs SET
-    status = 'pending',
+UPDATE jobs
+SET status = 'pending',
     executor_id = NULL,
     started_at = NULL,
     last_heartbeat = NULL
@@ -353,61 +434,60 @@ func (q *Queries) ResetStaleJob(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
-const updateJob = `-- name: UpdateJob :exec
-UPDATE jobs SET
-    status = COALESCE($2, status),
-    executor_id = COALESCE($3, executor_id),
-    stdout = COALESCE($4, stdout),
-    stderr = COALESCE($5, stderr),
-    exit_code = COALESCE($6, exit_code),
-    error_message = COALESCE($7, error_message),
-    started_at = COALESCE($8, started_at),
-    completed_at = COALESCE($9, completed_at),
-    last_heartbeat = COALESCE($10, last_heartbeat)
-WHERE id = $1
-`
-
-type UpdateJobParams struct {
-	ID            uuid.UUID          `json:"id"`
-	Status        string             `json:"status"`
-	ExecutorID    pgtype.Text        `json:"executor_id"`
-	Stdout        pgtype.Text        `json:"stdout"`
-	Stderr        pgtype.Text        `json:"stderr"`
-	ExitCode      pgtype.Int4        `json:"exit_code"`
-	ErrorMessage  pgtype.Text        `json:"error_message"`
-	StartedAt     pgtype.Timestamptz `json:"started_at"`
-	CompletedAt   pgtype.Timestamptz `json:"completed_at"`
-	LastHeartbeat pgtype.Timestamptz `json:"last_heartbeat"`
-}
-
-func (q *Queries) UpdateJob(ctx context.Context, arg UpdateJobParams) error {
-	_, err := q.db.Exec(ctx, updateJob,
-		arg.ID,
-		arg.Status,
-		arg.ExecutorID,
-		arg.Stdout,
-		arg.Stderr,
-		arg.ExitCode,
-		arg.ErrorMessage,
-		arg.StartedAt,
-		arg.CompletedAt,
-		arg.LastHeartbeat,
-	)
-	return err
-}
-
-const updateJobHeartbeat = `-- name: UpdateJobHeartbeat :exec
-UPDATE jobs SET
-    last_heartbeat = NOW()
+const updateHeartbeat = `-- name: UpdateHeartbeat :exec
+UPDATE jobs
+SET last_heartbeat = NOW()
 WHERE id = $1 AND executor_id = $2 AND status = 'running'
 `
 
-type UpdateJobHeartbeatParams struct {
+type UpdateHeartbeatParams struct {
 	ID         uuid.UUID   `json:"id"`
 	ExecutorID pgtype.Text `json:"executor_id"`
 }
 
-func (q *Queries) UpdateJobHeartbeat(ctx context.Context, arg UpdateJobHeartbeatParams) error {
-	_, err := q.db.Exec(ctx, updateJobHeartbeat, arg.ID, arg.ExecutorID)
+func (q *Queries) UpdateHeartbeat(ctx context.Context, arg UpdateHeartbeatParams) error {
+	_, err := q.db.Exec(ctx, updateHeartbeat, arg.ID, arg.ExecutorID)
 	return err
+}
+
+const updateJobStatus = `-- name: UpdateJobStatus :one
+UPDATE jobs
+SET status = $2,
+    started_at = CASE WHEN $2 = 'running' THEN COALESCE(started_at, NOW()) ELSE started_at END,
+    completed_at = CASE WHEN $2 IN ('completed', 'failed', 'cancelled') THEN NOW() ELSE completed_at END
+WHERE id = $1
+RETURNING id, type, binary_url, binary_sha256, arguments, env_variables, priority, status, executor_id, stdout, stderr, exit_code, error_message, created_at, started_at, completed_at, last_heartbeat, max_retries, retry_count, retry_after
+`
+
+type UpdateJobStatusParams struct {
+	ID     uuid.UUID `json:"id"`
+	Status string    `json:"status"`
+}
+
+func (q *Queries) UpdateJobStatus(ctx context.Context, arg UpdateJobStatusParams) (Job, error) {
+	row := q.db.QueryRow(ctx, updateJobStatus, arg.ID, arg.Status)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.Type,
+		&i.BinaryUrl,
+		&i.BinarySha256,
+		&i.Arguments,
+		&i.EnvVariables,
+		&i.Priority,
+		&i.Status,
+		&i.ExecutorID,
+		&i.Stdout,
+		&i.Stderr,
+		&i.ExitCode,
+		&i.ErrorMessage,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.LastHeartbeat,
+		&i.MaxRetries,
+		&i.RetryCount,
+		&i.RetryAfter,
+	)
+	return i, err
 }

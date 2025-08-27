@@ -21,8 +21,10 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/draganm/executr/internal/db"
+	"github.com/draganm/executr/internal/metrics"
 	"github.com/draganm/executr/internal/models"
 )
 
@@ -76,9 +78,12 @@ func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	s.setupRoutes(mux)
 
+	// Wrap with metrics middleware
+	handler := metrics.HTTPMiddleware(mux)
+
 	s.server = &http.Server{
 		Addr:    fmt.Sprintf(":%d", s.config.Port),
-		Handler: mux,
+		Handler: handler,
 	}
 
 	// Start HTTP server
@@ -179,6 +184,9 @@ func (s *Server) runMigrations() error {
 }
 
 func (s *Server) setupRoutes(mux *http.ServeMux) {
+	// Metrics endpoint (no middleware for this)
+	mux.Handle("/api/v1/metrics", promhttp.Handler())
+	
 	// Health check
 	mux.HandleFunc("/api/v1/health", s.handleHealth)
 
@@ -186,6 +194,14 @@ func (s *Server) setupRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/jobs", s.handleJobs)
 	mux.HandleFunc("/api/v1/jobs/", s.handleJobByID)
 	mux.HandleFunc("/api/v1/jobs/claim", s.handleClaimJob)
+	
+	// Bulk operations
+	mux.HandleFunc("/api/v1/jobs/bulk", s.handleBulkJobs)
+	mux.HandleFunc("/api/v1/jobs/bulk/cancel", s.handleBulkCancel)
+	
+	// Admin endpoints
+	mux.HandleFunc("/api/v1/admin/stats", s.handleAdminStats)
+	mux.HandleFunc("/api/v1/admin/executors", s.handleAdminExecutors)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -311,7 +327,6 @@ func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		Arguments:    submission.Arguments,
 		EnvVariables: envJSON,
 		Priority:     string(submission.Priority),
-		Status:       "pending",
 	})
 	if err != nil {
 		slog.Error("Failed to create job", "error", err)
@@ -319,6 +334,9 @@ func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Track metrics
+	metrics.JobsSubmitted.WithLabelValues(submission.Type, string(submission.Priority)).Inc()
+	
 	// Convert to response model
 	response := s.dbJobToModel(job)
 	
@@ -419,7 +437,7 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request, jobID uuid
 }
 
 func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request, jobID uuid.UUID) {
-	err := s.queries.CancelJob(r.Context(), jobID)
+	_, err := s.queries.CancelJob(r.Context(), jobID)
 	if err != nil {
 		slog.Error("Failed to cancel job", "error", err, "job_id", jobID)
 		s.writeError(w, http.StatusInternalServerError, "Failed to cancel job", nil)
@@ -459,11 +477,10 @@ func (s *Server) handleClaimJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Record job attempt
-	_, err = s.queries.CreateJobAttempt(r.Context(), db.CreateJobAttemptParams{
+	_, err = s.queries.RecordJobAttempt(r.Context(), db.RecordJobAttemptParams{
 		JobID:      job.ID,
 		ExecutorID: claim.ExecutorID,
 		ExecutorIp: claim.ExecutorIP,
-		Status:     "running",
 	})
 	if err != nil {
 		slog.Error("Failed to record job attempt", "error", err, "job_id", job.ID)
@@ -488,7 +505,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, jobID u
 	}
 
 	executorID := pgtype.Text{String: req.ExecutorID, Valid: true}
-	err := s.queries.UpdateJobHeartbeat(r.Context(), db.UpdateJobHeartbeatParams{
+	err := s.queries.UpdateHeartbeat(r.Context(), db.UpdateHeartbeatParams{
 		ID:         jobID,
 		ExecutorID: executorID,
 	})
@@ -513,12 +530,11 @@ func (s *Server) handleCompleteJob(w http.ResponseWriter, r *http.Request, jobID
 		return
 	}
 
-	err := s.queries.CompleteJob(r.Context(), db.CompleteJobParams{
+	_, err := s.queries.CompleteJob(r.Context(), db.CompleteJobParams{
 		ID:         jobID,
 		Stdout:     pgtype.Text{String: req.Stdout, Valid: true},
 		Stderr:     pgtype.Text{String: req.Stderr, Valid: true},
 		ExitCode:   pgtype.Int4{Int32: int32(req.ExitCode), Valid: true},
-		ExecutorID: pgtype.Text{String: req.ExecutorID, Valid: true},
 	})
 	if err != nil {
 		slog.Error("Failed to complete job", "error", err, "job_id", jobID)
@@ -552,13 +568,12 @@ func (s *Server) handleFailJob(w http.ResponseWriter, r *http.Request, jobID uui
 	if req.ExitCode != 0 {
 		exitCode = pgtype.Int4{Int32: int32(req.ExitCode), Valid: true}
 	}
-	err := s.queries.FailJob(r.Context(), db.FailJobParams{
+	_, err := s.queries.FailJob(r.Context(), db.FailJobParams{
 		ID:           jobID,
 		ErrorMessage: pgtype.Text{String: req.ErrorMessage, Valid: true},
 		Stdout:       stdout,
 		Stderr:       stderr,
 		ExitCode:     exitCode,
-		ExecutorID:   pgtype.Text{String: req.ExecutorID, Valid: true},
 	})
 	if err != nil {
 		slog.Error("Failed to fail job", "error", err, "job_id", jobID)
@@ -583,6 +598,13 @@ func (s *Server) startWorkers(ctx context.Context) {
 		defer s.wg.Done()
 		s.jobCleaner(ctx)
 	}()
+	
+	// Job retry worker
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.jobRetryWorker(ctx)
+	}()
 }
 
 func (s *Server) heartbeatMonitor(ctx context.Context) {
@@ -600,7 +622,7 @@ func (s *Server) heartbeatMonitor(ctx context.Context) {
 }
 
 func (s *Server) checkStaleJobs(ctx context.Context) {
-	jobs, err := s.queries.FindStaleJobs(ctx, int32(s.config.HeartbeatTimeout))
+	jobs, err := s.queries.FindStaleJobs(ctx)
 	if err != nil {
 		slog.Error("Failed to find stale jobs", "error", err)
 		return
@@ -629,11 +651,51 @@ func (s *Server) jobCleaner(ctx context.Context) {
 }
 
 func (s *Server) cleanupOldJobs(ctx context.Context) {
-	err := s.queries.CleanupOldJobs(ctx, int32(s.config.JobRetention))
+	interval := pgtype.Interval{}
+	// Convert hours to microseconds (1 hour = 3600 seconds = 3600000000 microseconds)
+	interval.Microseconds = int64(s.config.JobRetention) * 3600000000
+	interval.Valid = true
+	err := s.queries.CleanupOldJobs(ctx, interval)
 	if err != nil {
 		slog.Error("Failed to cleanup old jobs", "error", err)
 	} else {
 		slog.Debug("Cleaned up old jobs")
+		metrics.OldJobsCleaned.Inc()
+	}
+}
+
+func (s *Server) jobRetryWorker(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second) // Check every 30 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.retryFailedJobs(ctx)
+		}
+	}
+}
+
+func (s *Server) retryFailedJobs(ctx context.Context) {
+	jobs, err := s.queries.GetRetriableJobs(ctx)
+	if err != nil {
+		slog.Error("Failed to get retriable jobs", "error", err)
+		return
+	}
+
+	for _, job := range jobs {
+		if err := s.queries.IncrementJobRetry(ctx, job.ID); err != nil {
+			slog.Error("Failed to retry job", "job_id", job.ID, "error", err)
+			continue
+		}
+		
+		slog.Info("Retrying failed job", 
+			"job_id", job.ID, 
+			"type", job.Type,
+			"retry_count", job.RetryCount+1,
+			"max_retries", job.MaxRetries)
 	}
 }
 
@@ -700,4 +762,291 @@ func (s *Server) writeError(w http.ResponseWriter, code int, message string, con
 // Port returns the actual port the server is listening on
 func (s *Server) Port() int {
 	return s.port
+}
+
+// Admin endpoints
+
+func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+	
+	// Get job counts by status and priority
+	stats := make(map[string]interface{})
+	
+	// Count jobs by status
+	statusCounts, err := s.queries.CountJobsByStatus(ctx)
+	if err != nil {
+		slog.Error("Failed to get job status counts", "error", err)
+		s.writeError(w, http.StatusInternalServerError, "Failed to get statistics", nil)
+		return
+	}
+	
+	// Count pending jobs by priority  
+	priorityCounts, err := s.queries.CountPendingJobsByPriority(ctx)
+	if err != nil {
+		slog.Error("Failed to get priority counts", "error", err)
+		s.writeError(w, http.StatusInternalServerError, "Failed to get statistics", nil)
+		return
+	}
+	
+	// Get active executors count
+	executors, err := s.queries.GetActiveExecutors(ctx)
+	if err != nil {
+		slog.Error("Failed to get active executors", "error", err)
+		executors = []db.GetActiveExecutorsRow{}
+	}
+	
+	// Build response
+	stats["jobs_by_status"] = statusCounts
+	stats["pending_by_priority"] = priorityCounts
+	stats["active_executors"] = len(executors)
+	stats["timestamp"] = time.Now().UTC()
+	
+	// Update Prometheus metrics
+	pendingMap := make(map[string]int)
+	for _, p := range priorityCounts {
+		pendingMap[p.Priority] = int(p.Count)
+	}
+	
+	statusMaps := map[string]map[string]int{
+		"pending": pendingMap,
+		"running": make(map[string]int),
+		"completed": make(map[string]int),
+		"failed": make(map[string]int),
+		"cancelled": make(map[string]int),
+	}
+	
+	for _, s := range statusCounts {
+		if s.Status == "running" {
+			statusMaps["running"]["all"] = int(s.Count)
+		} else if s.Status == "completed" {
+			statusMaps["completed"]["all"] = int(s.Count)
+		} else if s.Status == "failed" {
+			statusMaps["failed"]["all"] = int(s.Count)
+		} else if s.Status == "cancelled" {
+			statusMaps["cancelled"]["all"] = int(s.Count)
+		}
+	}
+	
+	metrics.UpdateQueueMetrics(
+		statusMaps["pending"],
+		statusMaps["running"],
+		statusMaps["completed"],
+		statusMaps["failed"],
+		statusMaps["cancelled"],
+	)
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
+func (s *Server) handleAdminExecutors(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+	
+	// Get active executors (those with recent heartbeats)
+	executors, err := s.queries.GetActiveExecutors(ctx)
+	if err != nil {
+		slog.Error("Failed to get active executors", "error", err)
+		s.writeError(w, http.StatusInternalServerError, "Failed to get executors", nil)
+		return
+	}
+	
+	// Format response
+	type executorInfo struct {
+		ExecutorID    string    `json:"executor_id"`
+		CurrentJobID  *string   `json:"current_job_id,omitempty"`
+		JobType       *string   `json:"job_type,omitempty"`
+		LastHeartbeat time.Time `json:"last_heartbeat"`
+		JobsCompleted int64     `json:"jobs_completed"`
+	}
+	
+	var response []executorInfo
+	for _, e := range executors {
+		info := executorInfo{
+			ExecutorID:    e.ExecutorID.String,
+			LastHeartbeat: e.LastHeartbeat.Time,
+			JobsCompleted: e.JobsCompleted,
+		}
+		
+		// JobID is a UUID, not a nullable field
+		jobID := e.JobID.String()
+		info.CurrentJobID = &jobID
+		
+		// JobType is a string, not a nullable field  
+		info.JobType = &e.JobType
+		
+		response = append(response, info)
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// Bulk operations
+
+func (s *Server) handleBulkJobs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse bulk submission request
+	var submissions []models.JobSubmission
+	if err := json.NewDecoder(r.Body).Decode(&submissions); err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid request body", nil)
+		return
+	}
+
+	// Validate submissions
+	if len(submissions) == 0 {
+		s.writeError(w, http.StatusBadRequest, "No jobs provided", nil)
+		return
+	}
+
+	if len(submissions) > 100 {
+		s.writeError(w, http.StatusBadRequest, "Too many jobs (max 100)", nil)
+		return
+	}
+
+	// Submit jobs
+	type jobResult struct {
+		Index   int        `json:"index"`
+		Success bool       `json:"success"`
+		JobID   *uuid.UUID `json:"job_id,omitempty"`
+		Error   string     `json:"error,omitempty"`
+	}
+
+	results := make([]jobResult, len(submissions))
+	successCount := 0
+
+	for i, submission := range submissions {
+		// Validate required fields
+		if submission.Type == "" || submission.BinaryURL == "" {
+			results[i] = jobResult{
+				Index:   i,
+				Success: false,
+				Error:   "type and binary_url are required",
+			}
+			continue
+		}
+
+		// Create job
+		envJSON, _ := json.Marshal(submission.EnvVariables)
+		
+		job, err := s.queries.CreateJobWithRetries(r.Context(), db.CreateJobWithRetriesParams{
+			Type:         submission.Type,
+			BinaryUrl:    submission.BinaryURL,
+			BinarySha256: submission.BinarySHA256,
+			Arguments:    submission.Arguments,
+			EnvVariables: envJSON,
+			Priority:     string(submission.Priority),
+			Status:       "pending",
+			MaxRetries:   int32(submission.MaxRetries),
+		})
+
+		if err != nil {
+			results[i] = jobResult{
+				Index:   i,
+				Success: false,
+				Error:   err.Error(),
+			}
+		} else {
+			results[i] = jobResult{
+				Index:   i,
+				Success: true,
+				JobID:   &job.ID,
+			}
+			successCount++
+			
+			// Track metrics
+			metrics.JobsSubmitted.WithLabelValues(submission.Type, string(submission.Priority)).Inc()
+		}
+	}
+
+	// Return results
+	response := map[string]interface{}{
+		"total":      len(submissions),
+		"successful": successCount,
+		"failed":     len(submissions) - successCount,
+		"results":    results,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if successCount == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+	} else if successCount < len(submissions) {
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.WriteHeader(http.StatusCreated)
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
+func (s *Server) handleBulkCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse request
+	var request struct {
+		JobIDs []string `json:"job_ids"`
+		Type   string   `json:"type,omitempty"`
+		Status string   `json:"status,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid request body", nil)
+		return
+	}
+
+	// Cancel jobs
+	cancelledCount := 0
+	failedCount := 0
+
+	if len(request.JobIDs) > 0 {
+		// Cancel specific jobs
+		for _, jobIDStr := range request.JobIDs {
+			jobID, err := uuid.Parse(jobIDStr)
+			if err != nil {
+				failedCount++
+				continue
+			}
+
+			_, err = s.queries.CancelJob(r.Context(), jobID)
+			if err != nil {
+				failedCount++
+			} else {
+				cancelledCount++
+				metrics.JobsCancelled.Inc()
+			}
+		}
+	} else if request.Type != "" || request.Status != "" {
+		// Cancel by criteria
+		// This would need a new query to cancel jobs by type/status
+		s.writeError(w, http.StatusNotImplemented, "Cancellation by criteria not yet implemented", nil)
+		return
+	} else {
+		s.writeError(w, http.StatusBadRequest, "Must provide job_ids or criteria", nil)
+		return
+	}
+
+	// Return results
+	response := map[string]interface{}{
+		"cancelled": cancelledCount,
+		"failed":    failedCount,
+		"total":     cancelledCount + failedCount,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }

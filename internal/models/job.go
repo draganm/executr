@@ -74,6 +74,7 @@ type JobSubmission struct {
 	Arguments    []string          `json:"arguments,omitempty"`
 	EnvVariables map[string]string `json:"env_variables,omitempty"`
 	Priority     Priority          `json:"priority"`
+	MaxRetries   int               `json:"max_retries,omitempty"`
 }
 
 // ClaimRequest represents a job claim request from an executor
