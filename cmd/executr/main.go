@@ -2,14 +2,24 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"text/tabwriter"
 
 	"github.com/draganm/executr/internal/executor"
+	"github.com/draganm/executr/internal/models"
 	"github.com/draganm/executr/internal/server"
+	"github.com/draganm/executr/pkg/client"
+	"github.com/google/uuid"
 	"github.com/urfave/cli/v2"
 )
 
@@ -231,28 +241,349 @@ func submitCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "submit",
 		Usage: "Submit a job to executr",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:     "server-url",
+				Usage:    "Server API endpoint",
+				Required: true,
+				EnvVars:  []string{"EXECUTR_SERVER_URL"},
+			},
+			&cli.StringFlag{
+				Name:     "binary-url",
+				Usage:    "Binary download URL",
+				Required: true,
+				EnvVars:  []string{"EXECUTR_BINARY_URL"},
+			},
+			&cli.StringFlag{
+				Name:    "binary-sha256",
+				Usage:   "Binary SHA256 (optional, auto-calculated if not provided)",
+				EnvVars: []string{"EXECUTR_BINARY_SHA256"},
+			},
+			&cli.StringSliceFlag{
+				Name:    "args",
+				Usage:   "Arguments to pass to the binary (can be specified multiple times)",
+				EnvVars: []string{"EXECUTR_ARGS"},
+			},
+			&cli.StringSliceFlag{
+				Name:    "env",
+				Usage:   "Environment variables KEY=VALUE (can be specified multiple times)",
+				EnvVars: []string{"EXECUTR_ENV"},
+			},
+			&cli.StringFlag{
+				Name:    "type",
+				Usage:   "Job type (informational, cannot contain spaces)",
+				Value:   "default",
+				EnvVars: []string{"EXECUTR_TYPE"},
+			},
+			&cli.StringFlag{
+				Name:    "priority",
+				Usage:   "Priority (foreground/background/best_effort)",
+				Value:   "background",
+				EnvVars: []string{"EXECUTR_PRIORITY"},
+			},
+			&cli.StringFlag{
+				Name:    "output",
+				Usage:   "Output format (json/table)",
+				Value:   "table",
+				EnvVars: []string{"EXECUTR_OUTPUT"},
+			},
+		},
 		Action: func(c *cli.Context) error {
-			return fmt.Errorf("submit not yet implemented")
+			return submitJob(c)
 		},
 	}
 }
 
 func statusCommand() *cli.Command {
 	return &cli.Command{
-		Name:  "status",
-		Usage: "Get status of a job",
+		Name:      "status",
+		Usage:     "Get status of a job",
+		ArgsUsage: "<job-id>",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:     "server-url",
+				Usage:    "Server API endpoint",
+				Required: true,
+				EnvVars:  []string{"EXECUTR_SERVER_URL"},
+			},
+			&cli.StringFlag{
+				Name:    "output",
+				Usage:   "Output format (json/table)",
+				Value:   "table",
+				EnvVars: []string{"EXECUTR_OUTPUT"},
+			},
+		},
 		Action: func(c *cli.Context) error {
-			return fmt.Errorf("status not yet implemented")
+			if c.NArg() < 1 {
+				return fmt.Errorf("job ID is required")
+			}
+			return getJobStatus(c)
 		},
 	}
 }
 
 func cancelCommand() *cli.Command {
 	return &cli.Command{
-		Name:  "cancel",
-		Usage: "Cancel a pending job",
-		Action: func(c *cli.Context) error {
-			return fmt.Errorf("cancel not yet implemented")
+		Name:      "cancel",
+		Usage:     "Cancel a pending job",
+		ArgsUsage: "<job-id>",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:     "server-url",
+				Usage:    "Server API endpoint",
+				Required: true,
+				EnvVars:  []string{"EXECUTR_SERVER_URL"},
+			},
+			&cli.StringFlag{
+				Name:    "output",
+				Usage:   "Output format (json/table)",
+				Value:   "table",
+				EnvVars: []string{"EXECUTR_OUTPUT"},
+			},
 		},
+		Action: func(c *cli.Context) error {
+			if c.NArg() < 1 {
+				return fmt.Errorf("job ID is required")
+			}
+			return cancelJob(c)
+		},
+	}
+}
+
+// submitJob handles the job submission logic
+func submitJob(c *cli.Context) error {
+	serverURL := c.String("server-url")
+	binaryURL := c.String("binary-url")
+	binarySHA256 := c.String("binary-sha256")
+	jobType := c.String("type")
+	priority := c.String("priority")
+	outputFormat := c.String("output")
+
+	// Validate job type (no spaces allowed)
+	if strings.Contains(jobType, " ") {
+		return fmt.Errorf("job type cannot contain spaces")
+	}
+
+	// Validate priority
+	var jobPriority models.Priority
+	switch priority {
+	case "foreground":
+		jobPriority = models.PriorityForeground
+	case "background":
+		jobPriority = models.PriorityBackground
+	case "best_effort":
+		jobPriority = models.PriorityBestEffort
+	default:
+		return fmt.Errorf("invalid priority: %s (must be foreground/background/best_effort)", priority)
+	}
+
+	// Parse environment variables
+	envVars := make(map[string]string)
+	for _, env := range c.StringSlice("env") {
+		parts := strings.SplitN(env, "=", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid environment variable format: %s (expected KEY=VALUE)", env)
+		}
+		envVars[parts[0]] = parts[1]
+	}
+
+	// Calculate SHA256 if not provided
+	if binarySHA256 == "" {
+		calculatedSHA, err := calculateSHA256FromURL(binaryURL)
+		if err != nil {
+			return fmt.Errorf("failed to calculate SHA256: %w", err)
+		}
+		binarySHA256 = calculatedSHA
+		if outputFormat != "json" {
+			fmt.Fprintf(os.Stderr, "Calculated SHA256: %s\n", binarySHA256)
+		}
+	}
+
+	// Create client
+	cl := client.New(serverURL)
+
+	// Submit job
+	submission := &models.JobSubmission{
+		Type:         jobType,
+		BinaryURL:    binaryURL,
+		BinarySHA256: binarySHA256,
+		Arguments:    c.StringSlice("args"),
+		EnvVariables: envVars,
+		Priority:     jobPriority,
+	}
+
+	job, err := cl.SubmitJob(context.Background(), submission)
+	if err != nil {
+		return fmt.Errorf("failed to submit job: %w", err)
+	}
+
+	// Output result
+	switch outputFormat {
+	case "json":
+		output := map[string]string{
+			"job_id": job.ID.String(),
+		}
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(output)
+	default:
+		fmt.Printf("Job submitted successfully\n")
+		fmt.Printf("Job ID: %s\n", job.ID.String())
+		return nil
+	}
+}
+
+// calculateSHA256FromURL streams the binary from the URL and calculates SHA256
+func calculateSHA256FromURL(url string) (string, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("failed to download binary: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to download binary: HTTP %d", resp.StatusCode)
+	}
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, resp.Body); err != nil {
+		return "", fmt.Errorf("failed to read binary: %w", err)
+	}
+
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// getJobStatus handles fetching and displaying job status
+func getJobStatus(c *cli.Context) error {
+	serverURL := c.String("server-url")
+	outputFormat := c.String("output")
+	jobIDStr := c.Args().First()
+
+	// Parse job ID
+	jobID, err := uuid.Parse(jobIDStr)
+	if err != nil {
+		return fmt.Errorf("invalid job ID: %w", err)
+	}
+
+	// Create client
+	cl := client.New(serverURL)
+
+	// Get job
+	job, err := cl.GetJob(context.Background(), jobID)
+	if err != nil {
+		return fmt.Errorf("failed to get job: %w", err)
+	}
+
+	// Output result
+	switch outputFormat {
+	case "json":
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(job)
+	default:
+		return printJobTable(job)
+	}
+}
+
+// printJobTable prints job details in a formatted table
+func printJobTable(job *models.Job) error {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer w.Flush()
+
+	fmt.Fprintf(w, "Job ID:\t%s\n", job.ID)
+	fmt.Fprintf(w, "Type:\t%s\n", job.Type)
+	fmt.Fprintf(w, "Status:\t%s\n", job.Status)
+	fmt.Fprintf(w, "Priority:\t%s\n", job.Priority)
+	fmt.Fprintf(w, "Binary URL:\t%s\n", job.BinaryURL)
+	fmt.Fprintf(w, "Binary SHA256:\t%s\n", job.BinarySHA256)
+	
+	if len(job.Arguments) > 0 {
+		fmt.Fprintf(w, "Arguments:\t%s\n", strings.Join(job.Arguments, " "))
+	}
+	
+	if len(job.EnvVariables) > 0 {
+		fmt.Fprintf(w, "Environment:\n")
+		for k, v := range job.EnvVariables {
+			fmt.Fprintf(w, "  %s:\t%s\n", k, v)
+		}
+	}
+	
+	if job.ExecutorID != "" {
+		fmt.Fprintf(w, "Executor ID:\t%s\n", job.ExecutorID)
+	}
+	
+	fmt.Fprintf(w, "Created At:\t%s\n", job.CreatedAt.Format("2006-01-02 15:04:05 MST"))
+	
+	if job.StartedAt != nil {
+		fmt.Fprintf(w, "Started At:\t%s\n", job.StartedAt.Format("2006-01-02 15:04:05 MST"))
+	}
+	
+	if job.CompletedAt != nil {
+		fmt.Fprintf(w, "Completed At:\t%s\n", job.CompletedAt.Format("2006-01-02 15:04:05 MST"))
+	}
+	
+	if job.LastHeartbeat != nil {
+		fmt.Fprintf(w, "Last Heartbeat:\t%s\n", job.LastHeartbeat.Format("2006-01-02 15:04:05 MST"))
+	}
+	
+	if job.ErrorMessage != "" {
+		fmt.Fprintf(w, "Error:\t%s\n", job.ErrorMessage)
+	}
+	
+	if job.ExitCode != nil {
+		fmt.Fprintf(w, "Exit Code:\t%d\n", *job.ExitCode)
+	}
+	
+	// Show output if job is completed or failed
+	if job.Status == models.StatusCompleted || job.Status == models.StatusFailed {
+		if job.Stdout != "" {
+			fmt.Fprintf(w, "\n=== STDOUT ===\n")
+			fmt.Fprintln(w, job.Stdout)
+		}
+		
+		if job.Stderr != "" {
+			fmt.Fprintf(w, "\n=== STDERR ===\n")
+			fmt.Fprintln(w, job.Stderr)
+		}
+	}
+	
+	return nil
+}
+
+// cancelJob handles job cancellation
+func cancelJob(c *cli.Context) error {
+	serverURL := c.String("server-url")
+	outputFormat := c.String("output")
+	jobIDStr := c.Args().First()
+
+	// Parse job ID
+	jobID, err := uuid.Parse(jobIDStr)
+	if err != nil {
+		return fmt.Errorf("invalid job ID: %w", err)
+	}
+
+	// Create client
+	cl := client.New(serverURL)
+
+	// Cancel job
+	err = cl.CancelJob(context.Background(), jobID)
+	if err != nil {
+		return fmt.Errorf("failed to cancel job: %w", err)
+	}
+
+	// Output result
+	switch outputFormat {
+	case "json":
+		output := map[string]string{
+			"status": "cancelled",
+			"job_id": jobID.String(),
+		}
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(output)
+	default:
+		fmt.Printf("Job cancelled successfully\n")
+		fmt.Printf("Job ID: %s\n", jobID.String())
+		return nil
 	}
 }
