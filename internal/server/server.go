@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -45,6 +46,7 @@ type Server struct {
 	queries *db.Queries
 	server  *http.Server
 	wg      sync.WaitGroup
+	port    int // actual port (for testing with port 0)
 }
 
 // New creates a new server instance
@@ -79,14 +81,32 @@ func (s *Server) Run(ctx context.Context) error {
 		Handler: mux,
 	}
 
-	// Start HTTP server in goroutine
+	// Start HTTP server
 	serverErr := make(chan error, 1)
-	go func() {
-		slog.Info("Starting server", "port", s.config.Port)
-		if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serverErr <- err
+	
+	// If port is 0, use a listener to get the actual port
+	if s.config.Port == 0 {
+		listener, err := net.Listen("tcp", ":0")
+		if err != nil {
+			return fmt.Errorf("failed to create listener: %w", err)
 		}
-	}()
+		s.port = listener.Addr().(*net.TCPAddr).Port
+		slog.Info("Starting server", "port", s.port)
+		
+		go func() {
+			if err := s.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serverErr <- err
+			}
+		}()
+	} else {
+		s.port = s.config.Port
+		go func() {
+			slog.Info("Starting server", "port", s.port)
+			if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serverErr <- err
+			}
+		}()
+	}
 
 	// Wait for context cancellation or server error
 	select {
@@ -675,4 +695,9 @@ func (s *Server) writeError(w http.ResponseWriter, code int, message string, con
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(response)
+}
+
+// Port returns the actual port the server is listening on
+func (s *Server) Port() int {
+	return s.port
 }
